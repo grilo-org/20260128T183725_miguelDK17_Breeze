@@ -1,0 +1,142 @@
+
+name: Grilo SC Analysis for Java (Maven/Gradle)
+
+on:
+  push:
+    branches: [ "master", "main" ]
+  workflow_dispatch: {}
+
+jobs:
+  sonar-analysis:
+    name: SonarCloud Analysis
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # DETECÇÃO INTELIGENTE DE VERSÃO
+      - name: Detect Project Type and Java Version
+        id: project_info
+        run: |
+          # 1. Procura Maven
+          POM_PATH=$(find . -maxdepth 3 -name "pom.xml" -not -path "*/target/*" | head -n 1)
+          
+          # 2. Procura Gradle
+          GRADLE_PATH=$(find . -maxdepth 3 -name "gradlew" -o -name "build.gradle" -o -name "build.gradle.kts" | head -n 1)
+
+          if [ -n "$POM_PATH" ]; then
+            echo "Build System: Maven detected at $POM_PATH"
+            echo "build_system=maven" >> $GITHUB_OUTPUT
+            echo "build_file=$POM_PATH" >> $GITHUB_OUTPUT
+            # Maven geralmente roda bem com Java 17, mas projetos novos podem pedir 21. Default seguro: 21.
+            echo "java_version=21" >> $GITHUB_OUTPUT
+          
+          elif [ -n "$GRADLE_PATH" ]; then
+            echo "Build System: Gradle detected at $GRADLE_PATH"
+            echo "build_system=gradle" >> $GITHUB_OUTPUT
+            if [[ "$GRADLE_PATH" == *"gradlew"* ]]; then
+               DIR=$(dirname "$GRADLE_PATH")
+               echo "gradle_wrapper_dir=$DIR" >> $GITHUB_OUTPUT
+               
+               # Extrair versão do gradle-wrapper.properties para uso no fallback
+               PROPS_FILE="$DIR/gradle/wrapper/gradle-wrapper.properties"
+               if [ -f "$PROPS_FILE" ]; then
+                 GRADLE_VER=$(grep -oE 'gradle-[0-9.]+(-(bin|all))?.zip' "$PROPS_FILE" | grep -oE '[0-9]+.[0-9]+(.[0-9]+)?' | head -n 1)
+                 echo "Detected Gradle Version in properties: $GRADLE_VER"
+                 echo "detected_gradle_ver=$GRADLE_VER" >> $GITHUB_OUTPUT
+               fi
+            fi
+            # Gradles modernos (8.0+) preferem Java 17 ou 21.
+            echo "java_version=21" >> $GITHUB_OUTPUT
+          else
+             echo "::warning::Nenhum build system detectado."
+             echo "build_system=unknown" >> $GITHUB_OUTPUT
+             echo "java_version=21" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up JDK
+        uses: actions/setup-java@v3
+        with:
+          java-version: ${{ steps.project_info.outputs.java_version }}
+          distribution: 'temurin'
+
+      # --- EXECUÇÃO MAVEN ---
+
+      - name: Maven Analysis (Full)
+        if: steps.project_info.outputs.build_system == 'maven'
+        id: maven_full
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: mvn -B verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar -f ${{ steps.project_info.outputs.build_file }} -Dsonar.projectKey=grilo-org_20260128T183725_miguelDK17_Breeze -Dsonar.projectName=20260128T183725_miguelDK17_Breeze -Dsonar.host.url=https://sonarcloud.io -Dsonar.organization=grilo-org
+
+      - name: Maven Analysis (Fallback)
+        if: steps.project_info.outputs.build_system == 'maven' && steps.maven_full.outcome == 'failure'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          echo "::warning::Build Maven falhou. Tentando sem testes."
+          mvn -B verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar -Dmaven.test.skip=true -f ${{ steps.project_info.outputs.build_file }} -Dsonar.projectKey=grilo-org_20260128T183725_miguelDK17_Breeze -Dsonar.projectName=20260128T183725_miguelDK17_Breeze -Dsonar.host.url=https://sonarcloud.io -Dsonar.organization=grilo-org
+
+      # --- EXECUÇÃO GRADLE (ESTRATÉGIA DEFINITIVA) ---
+      
+      # TENTATIVA 1: WRAPPER DO CANDIDATO
+      - name: Gradle Build (Wrapper Strategy)
+        if: steps.project_info.outputs.build_system == 'gradle'
+        id: gradle_wrapper
+        continue-on-error: true
+        run: |
+          if [ -n "${{ steps.project_info.outputs.gradle_wrapper_dir }}" ]; then
+            cd ${{ steps.project_info.outputs.gradle_wrapper_dir }}
+            chmod +x gradlew
+            ./gradlew assembleDebug --no-daemon || ./gradlew assemble --no-daemon
+          else
+            gradle assembleDebug --no-daemon || gradle assemble --no-daemon
+          fi
+          
+      # TENTATIVA 2: SMART RESCUE (Instalação Manual da Versão DETECTADA)
+      # Corrige o problema do "Minimum supported Gradle version"
+      - name: Manual Install Detected Gradle (Smart Rescue)
+        if: steps.project_info.outputs.build_system == 'gradle' && steps.gradle_wrapper.outcome == 'failure'
+        id: smart_install
+        run: |
+           DETECTED_VER="${{ steps.project_info.outputs.detected_gradle_ver }}"
+           if [ -z "$DETECTED_VER" ]; then DETECTED_VER="8.10.2"; fi # Fallback seguro se não detectar
+           
+           echo "::warning::Wrapper falhou. Instalando Gradle $DETECTED_VER manualmente..."
+           wget -q "https://services.gradle.org/distributions/gradle-$DETECTED_VER-bin.zip"
+           unzip -q "gradle-$DETECTED_VER-bin.zip"
+           echo "$PWD/gradle-$DETECTED_VER/bin" >> $GITHUB_PATH
+
+      - name: Gradle Build (Smart Execution)
+        if: steps.project_info.outputs.build_system == 'gradle' && steps.gradle_wrapper.outcome == 'failure'
+        run: |
+           echo "::warning::Tentando compilar com Gradle (Manual Install)."
+           if [ -n "${{ steps.project_info.outputs.gradle_wrapper_dir }}" ]; then
+             cd ${{ steps.project_info.outputs.gradle_wrapper_dir }}
+           fi
+           # Roda sem lint e sem testes para aumentar chance de sucesso
+           gradle assembleDebug -x test -x lint --no-daemon || gradle assemble -x test -x lint --no-daemon
+
+      # 4. ANÁLISE SONAR
+      - name: SonarCloud Scan (Gradle Strategy)
+        if: steps.project_info.outputs.build_system == 'gradle'
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=grilo-org_20260128T183725_miguelDK17_Breeze
+            -Dsonar.projectName=20260128T183725_miguelDK17_Breeze
+            -Dsonar.organization=grilo-org
+            -Dsonar.java.binaries=**/build/classes,**/build/intermediates/javac,**/build/tmp/kotlin-classes
+            -Dsonar.sources=.
+            -Dsonar.tests=.
+            -Dsonar.test.inclusions=**/*Test.java,**/*Tests.java
+            -Dsonar.exclusions=**/*.class
